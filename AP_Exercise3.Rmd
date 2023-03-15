@@ -1,0 +1,574 @@
+---
+title: "AP_Exercise3"
+output:
+  html_document: default
+  pdf_document: default
+date: "2023-03-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(lubridate)
+library(scales)
+library(tidyverse)
+library(dbplyr)
+library(reshape2)
+library(readr)
+library(tidyr)
+library(broom)
+library(readxl)
+library(xtable)
+library(stargazer)
+library(mvtnorm)
+library(stats4)
+```
+
+
+## Problem 1
+Compute the average excess return of each factor and its OLS t-statistic. Compute the replication rate separately for equal-weighted (ew), value-weighted (vw),
+and capped-value-weighted (vw-cap) factors. I.e., compute three numbers.
+
+
+Load JKP data. Returns are reported as excess returns in USD.
+
+```{r}
+X_usa_all_factors_monthly_cap <- read_csv("[usa]_[all_factors]_[monthly]_[vw_cap].csv") 
+X_usa_all_factors_monthly_vw <- read_csv("[usa]_[all_factors]_[monthly]_[vw].csv")  
+X_usa_all_factors_monthly_ew <- read_csv("[usa]_[all_factors]_[monthly]_[ew].csv") 
+
+stats_cap = X_usa_all_factors_monthly_cap %>% 
+  group_by(name) %>% 
+  summarise(ttest = list(tidy(t.test(ret, mu=0, alternative = "two.sided" )))) %>% 
+  unnest() %>% 
+  select(name, mean = estimate, tstat = statistic, p.value)
+
+stats_ew = X_usa_all_factors_monthly_ew %>% 
+  group_by(name) %>% 
+  summarise(ttest = list(tidy(t.test(ret, mu=0, alternative = "two.sided" )))) %>% 
+  unnest() %>% 
+  select(name, mean = estimate, tstat = statistic, p.value)
+
+stats_vw = X_usa_all_factors_monthly_vw %>% 
+  group_by(name) %>% 
+  summarise(ttest = list(tidy(t.test(ret, mu=0, alternative = "two.sided" )))) %>% 
+  unnest() %>% 
+  select(name, mean = estimate, tstat = statistic, p.value)
+
+(stats_cap %>% filter(mean > 0, p.value < 0.05) %>% nrow())/ 153
+(stats_ew  %>% filter(mean > 0, p.value < 0.05) %>% nrow())/ 153
+(stats_vw  %>% filter(mean > 0, p.value < 0.05) %>% nrow())/ 153
+
+```
+
+
+## Problem 2
+
+Do the same as in question 1, but only for factors that were significant in the original study. For the list of these factors, download ”Factor Details.xlsx” from and use the factors where the column ”Significance” is 1. From here onwards, use only these factors in the computation of replication rates.
+
+
+```{r}
+Factors <- read_excel("Factor Details.xlsx") %>% filter(significance == 1)
+list_of_factors = Factors %>% pull(abr_jkp)
+
+(stats_cap %>% filter(name %in% list_of_factors) %>% filter(mean > 0, p.value < 0.05) %>% nrow())/ (Factors %>% nrow())
+(stats_ew  %>% filter(name %in% list_of_factors) %>% filter(mean > 0, p.value < 0.05) %>% nrow())/ (Factors %>% nrow())
+(stats_vw  %>% filter(name %in% list_of_factors) %>% filter(mean > 0, p.value < 0.05) %>% nrow())/ (Factors %>% nrow())
+```
+
+
+## Problem 3
+
+Compute the CAPM alpha, its OLS t-statistic, and p-values. Compute the replication rate, again separately for ew, vw, and vw-cap. Download the most recent market returns from the link mentioned in the README from https://github.com/bkelly-lab/ReplicationCrisis. 
+
+```{r}
+market_returns = read_csv("market_returns.csv")
+market_returns = market_returns %>% filter(excntry == "USA") %>% select(mkt_vw_exc, eom) %>% rename(date = "eom")
+
+X_usa_all_factors_monthly_cap = X_usa_all_factors_monthly_cap %>% filter(name %in% list_of_factors) %>% left_join(market_returns)
+X_usa_all_factors_monthly_vw  = X_usa_all_factors_monthly_vw  %>% filter(name %in% list_of_factors) %>% left_join(market_returns)
+X_usa_all_factors_monthly_ew  = X_usa_all_factors_monthly_ew  %>% filter(name %in% list_of_factors) %>% left_join(market_returns)
+
+library(lme4) # for lm by groups
+capm_a_cap = lmList(ret  ~ mkt_vw_exc | name, data = X_usa_all_factors_monthly_cap)
+capm_a_vw  = lmList(ret  ~ mkt_vw_exc | name, data = X_usa_all_factors_monthly_vw)
+capm_a_ew  = lmList(ret  ~ mkt_vw_exc | name, data = X_usa_all_factors_monthly_ew)
+
+# make data frames with alpha, OLS t-statistic, and p-values
+df_cap = lapply(
+  capm_a_cap, function(mod) {stat <- summary(mod)$coefficients[1,1:4]}
+   ) %>% as.data.frame() %>% t()  %>% as.data.frame()
+
+df_cap$factor <- row.names(df_cap)
+df_cap = df_cap %>% rename(alpha = Estimate, tstat = 't value', p.value = 'Pr(>|t|)') %>% select(factor, alpha, tstat, p.value)
+#rownames(df_cap) <- NULL
+
+df_vw = lapply(capm_a_vw, function(mod) {
+       stat <- summary(mod)$coefficients[1,1:4]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+
+df_vw$factor <- row.names(df_vw)
+df_vw = df_vw %>% rename(alpha = Estimate, tstat = 't value', p.value = 'Pr(>|t|)') %>% select(factor, alpha, tstat, p.value)
+#rownames(df_vw) <- NULL
+
+df_ew = lapply(capm_a_ew, function(mod) {
+       stat <- summary(mod)$coefficients[1,1:4]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+
+df_ew$factor <- row.names(df_ew)
+df_ew = df_ew %>% rename(alpha = Estimate, tstat = 't value', p.value = 'Pr(>|t|)') %>% select(factor, alpha, tstat, p.value)
+#rownames(df_ew) <- NULL
+
+
+# compute the replication rates
+(df_cap %>% filter(alpha > 0, p.value < 0.05) %>% nrow())/ (Factors %>% nrow())
+(df_ew  %>% filter(alpha > 0, p.value < 0.05) %>% nrow())/ (Factors %>% nrow())
+(df_vw  %>% filter(alpha > 0, p.value < 0.05) %>% nrow())/ (Factors %>% nrow())
+
+
+```
+
+## Problem 4 
+Implement the Bonferroni adjustment to the alpha p-values and report the corresponding replication rates.
+
+```{r}
+K = Factors %>% nrow()
+(df_cap %>% filter(alpha > 0, p.value < 0.05 / K) %>% nrow())/ (Factors %>% nrow())
+(df_ew  %>% filter(alpha > 0, p.value < 0.05 / K) %>% nrow())/ (Factors %>% nrow())
+(df_vw  %>% filter(alpha > 0, p.value < 0.05 / K) %>% nrow())/ (Factors %>% nrow())
+```
+ 
+## Problem 5 
+Implement the Benjamini-Hochberg adjustment to the alpha p-values and report the corresponding replication rates.
+
+```{r}
+df_cap = df_cap %>% arrange(p.value) %>% mutate(index = seq(1,119))
+df_vw  = df_vw  %>% arrange(p.value) %>% mutate(index = seq(1,119))
+df_ew  = df_ew  %>% arrange(p.value) %>% mutate(index = seq(1,119))
+
+p.value.bh  = list()
+p.value.bh1 = list()
+p.value.bh2 = list()
+
+for (i in 1:nrow(df_cap)){
+  p.value.bh[i]  = df_cap$p.value[i] <= (i/K)*0.05
+  p.value.bh1[i] = df_vw$p.value[i]  <= (i/K)*0.05
+  p.value.bh2[i] = df_ew$p.value[i]  <= (i/K)*0.05
+  
+}
+
+kbar_cap = which.min(p.value.bh   %>% unlist() ) -1
+kbar_vw  = which.min(p.value.bh1  %>% unlist() ) -1
+kbar_ew  = which.min(p.value.bh2  %>% unlist() ) -1
+
+(df_cap %>% filter(index <= kbar_cap, alpha > 0, p.value <= 0.05 *(kbar_cap/ K)) %>% nrow())/ (Factors %>% nrow())
+(df_ew  %>% filter(index <= kbar_ew,  alpha > 0, p.value <= 0.05 *(kbar_ew / K)) %>% nrow())/ (Factors %>% nrow())
+(df_vw  %>% filter(index <= kbar_vw,  alpha > 0, p.value <= 0.05 *(kbar_vw / K)) %>% nrow())/ (Factors %>% nrow())
+```
+
+## Problem 6
+```{r}
+start_date <- as.Date(ymd("1972-01-01"))
+end_date <- as.Date(ymd("2021-12-31"))
+"
+# Extract the betas from the OLS regression that computed the alpha
+beta_cap = lapply(capm_a_cap, function(mod) {
+       stat <- summary(mod)$coefficients[2,1]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+beta_cap$name <- row.names(beta_cap)
+beta_cap = beta_cap %>% rename(beta = V1)
+#rownames(beta_cap) <- NULL
+
+beta_vw = lapply(capm_a_vw, function(mod) {
+       stat <- summary(mod)$coefficients[2,1]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+beta_vw$name <- row.names(beta_vw)
+beta_vw = beta_vw %>% rename(beta = V1)
+#rownames(beta_vw) <- NULL
+
+beta_ew = lapply(capm_a_ew, function(mod) {
+       stat <- summary(mod)$coefficients[2,1]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+beta_ew$name <- row.names(beta_ew)
+beta_ew = beta_ew %>% rename(beta = V1)
+#rownames(beta_ew) <- NULL
+"
+####################################################################
+
+# Compute the betas using the new time period 
+X_usa_all_factors_monthly_cap = X_usa_all_factors_monthly_cap %>% filter(date >= start_date, date <= end_date)
+X_usa_all_factors_monthly_vw  = X_usa_all_factors_monthly_vw  %>% filter(date >= start_date, date <= end_date)
+X_usa_all_factors_monthly_ew  = X_usa_all_factors_monthly_ew  %>% filter(date >= start_date, date <= end_date)
+
+beta_i_cap = lmList(ret  ~ mkt_vw_exc | name, data = X_usa_all_factors_monthly_cap)
+beta_i_vw  = lmList(ret  ~ mkt_vw_exc | name, data = X_usa_all_factors_monthly_vw)
+beta_i_ew  = lmList(ret  ~ mkt_vw_exc | name, data = X_usa_all_factors_monthly_ew)
+
+beta_cap = lapply(beta_i_cap, function(mod) {
+       stat <- summary(mod)$coefficients[2,1]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+beta_cap$name <- row.names(beta_cap)
+beta_cap = beta_cap %>% rename(beta = V1)
+#rownames(beta_cap) <- NULL
+
+beta_vw = lapply(beta_i_vw, function(mod) {
+       stat <- summary(mod)$coefficients[2,1]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+beta_vw$name <- row.names(beta_vw)
+beta_vw = beta_vw %>% rename(beta = V1)
+#rownames(beta_vw) <- NULL
+
+beta_ew = lapply(beta_i_ew, function(mod) {
+       stat <- summary(mod)$coefficients[2,1]
+   }) %>% as.data.frame() %>% t()  %>% as.data.frame()
+beta_ew$name <- row.names(beta_ew)
+beta_ew = beta_ew %>% rename(beta = V1)
+#rownames(beta_ew) <- NULL
+
+# compute the scaled factor returns
+X_usa_all_factors_monthly_cap = X_usa_all_factors_monthly_cap %>% left_join(beta_cap, multiple="all") %>% 
+  filter(date >= start_date, date <= end_date) %>% 
+  group_by(name) %>% 
+  mutate(factor_return = ret - beta*mkt_vw_exc,
+         # compute the volatility scale
+         scaled_vol = (0.1/sqrt(12))/sd(factor_return),
+         # compute the scaled factor return
+         factor_return_scaled = factor_return*scaled_vol) %>% 
+  ungroup()
+
+X_usa_all_factors_monthly_vw = X_usa_all_factors_monthly_vw %>% left_join(beta_vw, multiple="all") %>% 
+  filter(date >= start_date, date <= end_date) %>% 
+  group_by(name) %>% 
+  mutate(factor_return = ret - beta*mkt_vw_exc,
+         # compute the volatility scale
+         scaled_vol = (0.1/sqrt(12))/sd(factor_return),
+         # compute the scaled factor return
+         factor_return_scaled = factor_return*scaled_vol) %>% 
+  ungroup()
+
+X_usa_all_factors_monthly_ew = X_usa_all_factors_monthly_ew %>% left_join(beta_ew, multiple="all") %>% 
+  filter(date >= start_date, date <= end_date) %>% 
+  group_by(name) %>% 
+  mutate(factor_return = ret - beta*mkt_vw_exc,
+         # compute the volatility scale
+         scaled_vol = (0.1/sqrt(12))/sd(factor_return),
+         # compute the scaled factor return
+         factor_return_scaled = factor_return*scaled_vol) %>% 
+  ungroup()
+
+```
+
+### Block covariance matrix - vw_cap
+
+```{r}
+ClusterLabels <- read_csv("ClusterLabels.csv") %>% filter(characteristic %in% list_of_factors)
+
+C = X_usa_all_factors_monthly_cap %>% 
+  select(name, factor_return_scaled) %>% 
+  pivot_wider(names_from = name, values_from = factor_return_scaled) %>% 
+  unnest() %>% 
+  cov()
+
+C_melt = melt(C) %>% rename(cor = value)
+
+C_melt_clusters = C_melt %>% 
+  left_join(ClusterLabels, by = c("Var1" = "characteristic")) %>% 
+  rename(cluster1= cluster)  %>% 
+  left_join(ClusterLabels, by = c("Var2" = "characteristic")) %>% 
+  rename(cluster2 = cluster)
+
+cluster_corrs = C_melt_clusters %>% 
+  group_by(cluster1, cluster2) %>% 
+  summarise(cor_mean = mean(cor)) %>% 
+  mutate(clusters_collected = str_c(cluster1, cluster2, sep = "", collapse = NULL))
+
+cluster_corrs_matrix_cap = cluster_corrs %>% select(-clusters_collected) %>% pivot_wider(names_from = cluster2, values_from = cor_mean)
+
+#  119 × 119 block correlation matrix
+cluster_corrs_c = cluster_corrs %>% ungroup() %>% select(cor_mean, clusters_collected)
+
+C_block_cap = C_melt_clusters %>% 
+  mutate(clusters_collected = str_c(cluster1, cluster2, sep = "", collapse = NULL)) %>% 
+  left_join(cluster_corrs_c, by="clusters_collected") %>% 
+  select(Var1, Var2, cor_mean) %>% 
+  mutate(cor_mean = ifelse(Var1==Var2, 1, cor_mean)) %>% 
+  pivot_wider(names_from = Var2, values_from = cor_mean)
+
+C_block_cap_matrix = C_block_cap %>% select(-Var1) %>% as.matrix()
+C = C %>% as.matrix()
+
+Sigma_block_cap = diag(sqrt(C)) * C_block_cap_matrix * diag(sqrt(C))
+
+bmatrix = function(x, digits=2, ...) {
+  library(xtable)
+  default_args = list(include.colnames=FALSE, only.contents=TRUE,
+                      include.rownames=FALSE, hline.after=NULL, comment=FALSE,
+                      print.results=FALSE)
+  passed_args = list(...)
+  calling_args = c(list(x=xtable(x, digits=digits)),
+                   c(passed_args,
+                     default_args[setdiff(names(default_args), names(passed_args))]))
+  cat("\\begin{bmatrix}\n",
+      do.call(print.xtable, calling_args),
+      "\\end{bmatrix}\n")
+}
+# print vw_cap cluster correlation matrix
+#x = cluster_corrs_matrix_cap %>% ungroup() %>% select(-cluster1) %>% as.matrix()
+#rownames(x) = colnames(x)
+#bmatrix(x*1e+04)
+#print(xtable(x*1e+04, type = "latex"))
+
+```
+
+## Problem 7 - cap
+
+Separately for ew, vw, and vw-cap factors, use maximum likelihood to find the most likely value of tau_c and tau_w given the observed data and Sigma_block from the previous question. Report your estimated values of tau_c and tau_w.
+
+```{r}
+X_wide_cap = X_usa_all_factors_monthly_cap %>% select(name, factor_return_scaled, date) %>% pivot_wider(names_from = name, values_from = factor_return_scaled) 
+
+X_matrix_cap = X_wide_cap %>% select(-date) %>% as.matrix() %>% apply(2, mean) # 2 means we take the column mean (i.e. factor mean)
+```
+
+We start by creating a function for $\Omega$ (the variance matrix of alpha), which takes in tau_c and tau_w as arguments. For this we need a matrix for connecting the individual factors and the theme clusters (what they call M in the Replication crisis paper). 
+
+```{r}
+M = ClusterLabels %>% mutate(col = 1) %>% pivot_wider(names_from = cluster, values_from = col) %>% select(-characteristic) %>% as.matrix() 
+M[is.na(M)] = 0
+rownames(M) = ClusterLabels$characteristic
+MM = M %*% t(M)
+
+Omega_func = function(tau_c, tau_w){ 
+  return(MM * tau_c^2 + diag(nrow(ClusterLabels)) * tau_w^2) # equation B.2
+}
+
+loglikelihood = function(tau_c, tau_w){
+  Omega = Omega_func(tau_c = tau_c, tau_w = tau_w)
+  alphahat_cov = Omega + Sigma_block_cap / 600
+  
+  return(-dmvnorm(x = X_matrix_cap, sigma = alphahat_cov, log = TRUE) )
+}
+
+hyper_parameters = abs(coef(mle(minuslogl = loglikelihood, start = c(tau_c = 0.0035, tau_w = 0.0021), method = "BFGS")))
+
+100*hyper_parameters
+```
+
+## Problem 8 - cap
+
+```{r}
+Omega_cap = Omega_func(tau_c = 0.0035, tau_w = 0.0021)
+alphahat_cap = df_cap$alpha %>% as.matrix()                     # 119 x 1
+V_cap = solve(solve(Omega_cap) + 600*solve(Sigma_block_cap))    # 119 x 119
+EE_cap =  600*V_cap %*% solve(Sigma_block_cap) %*% X_matrix_cap # 119 x 1
+
+z = list()
+
+for (i in 1:119){
+  z[i] = EE_cap[i]/sqrt(V_cap[i,i]) # equation 26 
+}
+
+z = z %>% unlist()
+mean(z > 1.96) # note: don't take absolute values, then it would be two-sided
+
+```
+
+
+### Block covariance matrix - vw
+
+```{r}
+ClusterLabels <- read_csv("ClusterLabels.csv") %>% filter(characteristic %in% list_of_factors)
+
+C = X_usa_all_factors_monthly_vw %>% 
+  select(name, factor_return_scaled) %>% 
+  pivot_wider(names_from = name, values_from = factor_return_scaled) %>% 
+  unnest() %>% 
+  cov()
+
+C_melt = melt(C) %>% rename(cor = value)
+
+C_melt_clusters = C_melt %>% 
+  left_join(ClusterLabels, by = c("Var1" = "characteristic")) %>% 
+  rename(cluster1= cluster)  %>% 
+  left_join(ClusterLabels, by = c("Var2" = "characteristic")) %>% 
+  rename(cluster2 = cluster)
+
+cluster_corrs = C_melt_clusters %>% 
+  group_by(cluster1, cluster2) %>% 
+  summarise(cor_mean = mean(cor)) %>% 
+  mutate(clusters_collected = str_c(cluster1, cluster2, sep = "", collapse = NULL))
+
+cluster_corrs_matrix_cap = cluster_corrs %>% select(-clusters_collected) %>% pivot_wider(names_from = cluster2, values_from = cor_mean)
+
+#  119 × 119 block correlation matrix
+cluster_corrs_c = cluster_corrs %>% ungroup() %>% select(cor_mean, clusters_collected)
+
+C_block_cap = C_melt_clusters %>% 
+  mutate(clusters_collected = str_c(cluster1, cluster2, sep = "", collapse = NULL)) %>% 
+  left_join(cluster_corrs_c, by="clusters_collected") %>% 
+  select(Var1, Var2, cor_mean) %>% 
+  mutate(cor_mean = ifelse(Var1==Var2, 1, cor_mean)) %>% 
+  pivot_wider(names_from = Var2, values_from = cor_mean)
+
+C_block_cap_matrix = C_block_cap %>% select(-Var1) %>% as.matrix()
+C = C %>% as.matrix()
+
+Sigma_block = diag(sqrt(C)) * C_block_cap_matrix * diag(sqrt(C))
+
+```
+
+## Problem 7 - vw
+
+Separately for ew, vw, and vw-cap factors, use maximum likelihood to find the most likely value of tau_c and tau_w given the observed data and Sigma_block from the previous question. Report your estimated values of tau_c and tau_w.
+
+```{r}
+X_wide = X_usa_all_factors_monthly_vw %>% select(name, factor_return_scaled, date) %>% pivot_wider(names_from = name, values_from = factor_return_scaled) 
+
+X_matrix = X_wide %>% select(-date) %>% as.matrix() %>% apply(2, mean) # 2 means we take the column mean (i.e. factor mean)
+```
+
+We start by creating a function for $\Omega$ (the variance matrix of alpha), which takes in tau_c and tau_w as arguments. For this we need a matrix for connecting the individual factors and the theme clusters (what they call M in the Replication crisis paper). 
+
+```{r}
+M = ClusterLabels %>% mutate(col = 1) %>% pivot_wider(names_from = cluster, values_from = col) %>% select(-characteristic) %>% as.matrix() 
+M[is.na(M)] = 0
+rownames(M) = ClusterLabels$characteristic
+MM = M %*% t(M)
+
+Omega_func = function(tau_c, tau_w){ 
+  return(MM * tau_c^2 + diag(nrow(ClusterLabels)) * tau_w^2) # equation B.2
+}
+
+loglikelihood = function(tau_c, tau_w){
+  Omega = Omega_func(tau_c = tau_c, tau_w = tau_w)
+  alphahat_cov = Omega + Sigma_block / 600
+  
+  return(-dmvnorm(x = X_matrix, sigma = alphahat_cov, log = TRUE) )
+}
+
+hyper_parameters = abs(coef(mle(minuslogl = loglikelihood, start = c(tau_c = 0.0035, tau_w = 0.0021), method = "BFGS")))
+
+100*hyper_parameters
+```
+
+
+## Problem 8 - vw
+
+```{r}
+Omega = Omega_func(tau_c = 0.0035, tau_w = 0.0021)
+V = solve(solve(Omega) + 600*solve(Sigma_block))    # 119 x 119
+EE =  600*V_cap %*% solve(Sigma_block) %*% X_matrix # 119 x 1
+
+z = list()
+
+for (i in 1:119){
+  z[i] = EE[i]/sqrt(V[i,i]) # equation 26 
+}
+
+z = z %>% unlist()
+mean(z > 1.96) # note: don't take absolute values, then it would be two-sided
+
+```
+
+### Block covariance matrix - ew
+
+```{r}
+ClusterLabels <- read_csv("ClusterLabels.csv") %>% filter(characteristic %in% list_of_factors)
+
+C = X_usa_all_factors_monthly_ew %>% 
+  select(name, factor_return_scaled) %>% 
+  pivot_wider(names_from = name, values_from = factor_return_scaled) %>% 
+  unnest() %>% 
+  cov()
+
+C_melt = melt(C) %>% rename(cor = value)
+
+C_melt_clusters = C_melt %>% 
+  left_join(ClusterLabels, by = c("Var1" = "characteristic")) %>% 
+  rename(cluster1= cluster)  %>% 
+  left_join(ClusterLabels, by = c("Var2" = "characteristic")) %>% 
+  rename(cluster2 = cluster)
+
+cluster_corrs = C_melt_clusters %>% 
+  group_by(cluster1, cluster2) %>% 
+  summarise(cor_mean = mean(cor)) %>% 
+  mutate(clusters_collected = str_c(cluster1, cluster2, sep = "", collapse = NULL))
+
+cluster_corrs_matrix_cap = cluster_corrs %>% select(-clusters_collected) %>% pivot_wider(names_from = cluster2, values_from = cor_mean)
+
+#  119 × 119 block correlation matrix
+cluster_corrs_c = cluster_corrs %>% ungroup() %>% select(cor_mean, clusters_collected)
+
+C_block_cap = C_melt_clusters %>% 
+  mutate(clusters_collected = str_c(cluster1, cluster2, sep = "", collapse = NULL)) %>% 
+  left_join(cluster_corrs_c, by="clusters_collected") %>% 
+  select(Var1, Var2, cor_mean) %>% 
+  mutate(cor_mean = ifelse(Var1==Var2, 1, cor_mean)) %>% 
+  pivot_wider(names_from = Var2, values_from = cor_mean)
+
+C_block_cap_matrix = C_block_cap %>% select(-Var1) %>% as.matrix()
+C = C %>% as.matrix()
+
+Sigma_block = diag(sqrt(C)) * C_block_cap_matrix * diag(sqrt(C))
+
+```
+
+## Problem 7 - ew
+
+Separately for ew, vw, and vw-cap factors, use maximum likelihood to find the most likely value of tau_c and tau_w given the observed data and Sigma_block from the previous question. Report your estimated values of tau_c and tau_w.
+
+```{r}
+X_wide = X_usa_all_factors_monthly_ew %>% select(name, factor_return_scaled, date) %>% pivot_wider(names_from = name, values_from = factor_return_scaled) 
+
+X_matrix = X_wide %>% select(-date) %>% as.matrix() %>% apply(2, mean) # 2 means we take the column mean (i.e. factor mean)
+```
+
+We start by creating a function for $\Omega$ (the variance matrix of alpha), which takes in tau_c and tau_w as arguments. For this we need a matrix for connecting the individual factors and the theme clusters (what they call M in the Replication crisis paper). 
+
+```{r}
+M = ClusterLabels %>% mutate(col = 1) %>% pivot_wider(names_from = cluster, values_from = col) %>% select(-characteristic) %>% as.matrix() 
+M[is.na(M)] = 0
+rownames(M) = ClusterLabels$characteristic
+MM = M %*% t(M)
+
+Omega_func = function(tau_c, tau_w){ 
+  return(MM * tau_c^2 + diag(nrow(ClusterLabels)) * tau_w^2) # equation B.2
+}
+
+loglikelihood = function(tau_c, tau_w){
+  Omega = Omega_func(tau_c = tau_c, tau_w = tau_w)
+  alphahat_cov = Omega + Sigma_block / 600
+  
+  return(-dmvnorm(x = X_matrix, sigma = alphahat_cov, log = TRUE) )
+}
+
+hyper_parameters = abs(coef(mle(minuslogl = loglikelihood, start = c(tau_c = 0.0035, tau_w = 0.0021), method = "BFGS")))
+
+100*hyper_parameters
+```
+
+
+## Problem 8 - ew
+
+```{r}
+Omega = Omega_func(tau_c = 0.0035, tau_w = 0.0021)
+V = solve(solve(Omega) + 600*solve(Sigma_block))    # 119 x 119
+EE =  600*V_cap %*% solve(Sigma_block) %*% X_matrix # 119 x 1
+
+z = list()
+
+for (i in 1:119){
+  z[i] = EE[i]/sqrt(V[i,i]) # equation 26 
+}
+
+z = z %>% unlist()
+mean(z > 1.96) # note: don't take absolute values, then it would be two-sided
+```
+
+
+
+
+
+
+
+
