@@ -1,0 +1,822 @@
+---
+title: "AP_exercise4"
+output: html_document
+date: "2023-03-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(lubridate)
+library(scales)
+library(tidyverse)
+library(dbplyr)
+library(reshape2)
+library(readr)
+library(tidyr)
+library(broom)
+library(readxl)
+library(xtable)
+library(stargazer)
+library(mvtnorm)
+library(stats4)
+library(zoo)
+library(glmnet)
+library(randomForest)
+library(ranger) 
+library(lme4)
+
+gbr_original <- read_csv("gbr.csv")
+```
+
+
+## Problem 1
+
+```{r}
+#str(gbr_original)
+
+chars = list("be_me", "ret_12_1", "market_equity", "ret_1_0", "rvol_252d", "beta_252d", "qmj_safety", "rmax1_21d", "chcsho_12m", "ni_me", "eq_dur", "ret_60_12", "ope_be", "gp_at", "ebit_sale", "at_gr1", "sale_gr1", "at_be", "cash_at", "age", "z_score")
+
+# we apply filters a and b
+gbr = gbr_original %>% 
+  select(be_me, ret_12_1, market_equity, ret_1_0, rvol_252d, beta_252d, qmj_safety, rmax1_21d, 
+         chcsho_12m, ni_me, eq_dur, ret_60_12, ope_be, gp_at, ebit_sale, at_gr1, sale_gr1, at_be,
+         cash_at, age, z_score, ret_exc_lead1m, size_grp, eom, gvkey) %>% 
+  filter(ymd(eom) >= ymd("1991-12-31")) %>% 
+  filter(!is.na(market_equity) & !is.na(ret_exc_lead1m))  
+
+# We count how many missing characteristic values for each observation (row) and apply filter c and d
+gbr$na_count = apply(is.na(gbr[,unlist(chars)]), 1, sum) 
+gbr = gbr %>% filter(na_count <= 5, size_grp != 'nano') %>% select(-na_count)
+
+# We standardize the characteristics data (the predictor variables), before calculating the median
+gbr = gbr %>% 
+  pivot_longer(cols = be_me:z_score, names_to = "name", values_to = "characteristic") %>% 
+  group_by(eom, name) %>% 
+  mutate(# compute the standardized characteristics
+         characteristic = (characteristic-mean(characteristic, na.rm=TRUE))/sd(characteristic, na.rm=TRUE)) 
+
+# compute the medians and apply filter e
+medians = gbr %>% 
+  group_by(eom, name) %>% 
+  summarise(median_c = median(characteristic, na.rm=TRUE)) 
+
+gbr = gbr %>% 
+  left_join(medians, multiple = "all") %>% 
+  mutate(characteristic = ifelse(is.na(characteristic), median_c, characteristic)) %>% 
+  select(-median_c) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = name, values_from = characteristic)
+
+gbr %>% 
+  mutate(monthyear = as.yearmon(ymd(eom))) %>% 
+  count(monthyear) %>% 
+  ggplot() +
+  aes(x = monthyear, y = n) +
+  geom_point(color="grey", shape=4) +
+  geom_line() +
+  theme_bw() +
+  labs(y = "Number of avaiable stocks", x = "Date")
+
+```
+
+
+
+## Problem 2
+
+Fit each model using the training data. Predict next month’s excess return over the training period using only the 3 characteristics. Specifically, perform this analysis using the following three models.
+
+### a) An OLS regression
+
+```{r}
+
+gbr_train = gbr %>% filter(year(ymd(eom)) <= year(ymd("2011-01-01"))) 
+
+
+# we run a cross-sectional regressions with the characteristics as explanatory variables for each month
+# We regress the returns of the test assets at a particular time point on the characteristisc of each asset
+eom_lm = gbr_train %>% 
+  # select the variables we need for the regression
+  select(ret_exc_lead1m, eom, gvkey, be_me, ret_12_1, market_equity) %>% 
+  # make a "data set" for each date
+  nest(data = -eom) %>% 
+  mutate(lm = map(data, # map: Apply a function to each element of a vector -> do a regression for each time point
+                    ~tidy(lm(ret_exc_lead1m ~ be_me + ret_12_1 + market_equity, data = .x))) # extract summary statistics
+         ) %>% 
+  unnest(lm)
+  
+# average across the time-series dimension
+coefficients = eom_lm %>% 
+  group_by(term) %>% # for each regression variable
+  summarize(
+    estimate_mean = mean(estimate),
+    std_error = 1/sqrt(n())*sqrt(mean((estimate - estimate_mean)^2))
+  )
+
+#xtable(coefficients, digits = 4)
+
+```
+
+
+
+### b) A Ridge regression
+
+nb: ridge regression requires the data to be standardized, such that each predictor variable has a mean of 0 and a standard deviation of 1. We have done that already in Problem 1, so set standardize=False
+
+```{r}
+gbr_train_v = gbr_train %>% filter(year(ymd(eom)) < year(ymd("2005-01-01"))) 
+gbr_val = gbr_train %>% filter(year(ymd(eom)) >= year(ymd("2005-01-01"))) 
+
+# define response variable and predictor matrix
+y = gbr_train_v$ret_exc_lead1m
+x = gbr_train_v %>% dplyr::select(be_me, ret_12_1, market_equity) %>% as.matrix()
+
+y_val = gbr_val$ret_exc_lead1m
+x_val = gbr_val %>% dplyr::select(be_me, ret_12_1, market_equity) %>% as.matrix()
+
+y_train = gbr_train$ret_exc_lead1m
+x_train = gbr_train %>% dplyr::select(be_me, ret_12_1, market_equity) %>% as.matrix()
+
+
+# define lambda interval
+lambda_interval =  seq(0.001, 10, length=10000) #  10^seq(10, -2, length = 100) #
+# if the interval was up to 100, the coefficients are basically zero after loglambda=2, so pick interval (0,10) 
+
+# perform Ridge regression for each lambda value
+ridge_train = glmnet(x, y, alpha=0, standardize=FALSE, lambda=lambda_interval)
+
+#plot(ridge_train, xvar = "lambda")
+
+# Use the estimated parameter to predict the return over the validation period
+# pick the lambda that have the lowest mean-squared error
+
+mse_val = list()
+
+# for each lambda and beta_lambda, calculate the validation MSE
+for (i in 1:length(lambda_interval)){
+  
+  ridge_val = predict(ridge_train, s = lambda_interval[i], newx = x_val)
+  
+  mse_val[i] = mean((ridge_val - y_val)^2)
+  
+}
+
+lambda_hat = lambda_interval[which.min(unlist(mse_val))]
+
+plot(lambda_interval, mse_val)
+
+df = data.frame(lambda_interval, unlist(mse_val)) 
+
+best_lambda = subset(df,lambda_interval == lambda_hat)
+
+
+df %>% 
+  ggplot() +
+  aes(x = lambda_interval, y = unlist.mse_val.) +
+  geom_point(col = "grey") + 
+  geom_point(data=best_lambda, color="red") +
+  theme_bw() +
+  labs(y = "Validation set mean-squared error", x = "Ridge parameter, lambda") +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.000001, decimal.mark = '.')) + 
+  geom_text(data=best_lambda, label="(0.684, 0.02087921)", vjust=-1, hjust=0, color="red")
+
+# Based on the optimal ridge parameter, lambda_hat, re-estimate the ridge regression coefficient using the entire in-sample data 
+ridge_best <- glmnet(x_train, y_train, alpha=0, standardize=FALSE, lambda = lambda_hat)
+
+```
+
+
+### c) A Random Forest
+
+
+```{r}
+hyperparams_grid = expand.grid(
+  mtry = c(1/3, 2/3, 1)*ncol(x), 
+  max.depth = c(1,2,3), # longest path between the root node and the leaf node
+  min.node.size = c(1, 10000) 
+)
+
+for(i in 1:nrow(hyperparams_grid)) {
+  # fit model for ith hyperparameter combination
+  rf_train = ranger(
+    formula         = ret_exc_lead1m ~ be_me + ret_12_1 + market_equity, 
+    data            = gbr_train_v, 
+    sample.fraction = 0.5, # fraction of observations to use in each tree: 50% of original data set
+    num.trees       = 500, # number of trees to build
+    mtry            = hyperparams_grid$mtry[i],
+    min.node.size   = hyperparams_grid$min.node.size[i],
+    max.depth       = hyperparams_grid$max.depth[i],
+    verbose         = FALSE, # Show computation status and estimated runtime
+    seed            = 1
+  )
+# export validation set MSE
+  rf_val = predict(rf_train, data = x_val)$predictions
+  hyperparams_grid$mse_val[i] = mean((rf_val - y_val)^2)
+  
+}
+
+best_hyperparams <- subset(hyperparams_grid, mse_val==min(mse_val))
+best_hyper <- type.convert(best_hyperparams, as.is = TRUE)  %>% 
+  pivot_longer(values_to = "value", names_to = "hyper_parameter", cols = mtry:min.node.size) 
+
+#  Based on the optimal hyper-parameters, re-estimate the random forest using the entire in-sample data
+
+rf_best = ranger(
+    formula         = ret_exc_lead1m ~ be_me + ret_12_1 + market_equity, 
+    data            = gbr_train, 
+    sample.fraction = 0.5, # fraction of observations to use in each tree: 50% of original data set
+    num.trees       = 500, # number of trees to build
+    mtry            = best_hyperparams$mtry[1],
+    min.node.size   = best_hyperparams$min.node.size[1],
+    max.depth       = best_hyperparams$max.depth[1],
+    verbose         = FALSE, # Show computation status and estimated runtime
+    seed            = 1, # for replication purposes
+    importance = "impurity" # so we can apply vip() later
+  )
+
+# plot 
+hyperparams_grid %>% 
+  arrange(mse_val) %>% 
+  pivot_longer(values_to = "value", names_to = "hyper_parameter", cols = mtry:min.node.size) %>% 
+  ggplot(aes(x=value, y = mse_val)) + 
+  geom_point() + 
+  geom_point(data=best_hyper, aes(x=value, y = mse_val), color="red") +
+  facet_wrap(vars(hyper_parameter), scales = "free_x") +
+  theme_bw() +
+  geom_text(data=best_hyper[2:3,], label="MSE = 0.0208674", vjust=0, hjust=-0.1, color="red", size=2.5) +
+  geom_text(data=best_hyper[1,], label="MSE = 0.0208674", vjust=0, hjust=1.1, color="red", size=2.5) +
+  geom_text(data=best_hyper[6,], label="MSE = 0.0208674", vjust=0, hjust=1.1, color="red", size=2.5) +
+  labs(y = "Validation set mean-squared error", x = "")
+
+```
+
+
+## Problem 3
+
+```{r}
+coef_ols = as.matrix(coefficients[c(1,2,4,3),]$estimate_mean) 
+# as.matrix makes it the wrong dimension - transpose to match coefficients
+predict_insam_ols   = t(coef_ols) %*% t(as.matrix(cbind(rep(1, nrow(x_train)), x_train)))
+predict_insam_ridge = predict(ridge_best, newx = x_train)
+predict_insam_rf    = predict(rf_best, data = x_train)$predictions
+
+denom = sum( (y_train - mean(y_train))^2)
+
+Rsqr_insam_ols   = 1 - sum((y_train - predict_insam_ols)^2)/ denom
+Rsqr_insam_ridge = 1 - sum((y_train - predict_insam_ridge)^2)/ denom
+Rsqr_insam_rf    = 1 - sum((y_train - predict_insam_rf)^2 )/ denom
+
+inrs = data.frame(model = c("ols.3", "ridge.3", "rf.3"),
+                   is = c(Rsqr_insam_ols, Rsqr_insam_ridge, Rsqr_insam_rf)*100
+           )
+```
+
+## Problem 4
+
+```{r}
+# OLS
+coefficients %>% mutate(varimp = abs(estimate_mean / std_error)) %>% select(term, varimp) %>% xtable(digits=4)
+
+# Ridge 
+round(abs(coef(ridge_best)),digits=5)
+
+# Random forest
+round(abs(rf_best$variable.importance),digits=4)
+
+```
+
+
+
+## Problem 5 
+
+a) Out-of-sample R-squared 
+
+```{r}
+gbr_test = gbr %>% filter(year(ymd(eom)) > year(ymd("2011-01-01"))) 
+
+x_test = gbr_test %>% dplyr::select(be_me, ret_12_1, market_equity) %>% as.matrix()
+
+coef_ols = as.matrix(coefficients[c(1,2,4,3),]$estimate_mean) 
+
+predict_ols   = t(coef_ols) %*% t(as.matrix(cbind(rep(1, nrow(x_test)), x_test)))
+predict_ridge = predict(ridge_best, newx = x_test)
+predict_rf    = predict(rf_best, data = x_test)$predictions
+
+denom_oos = sum((gbr_test$ret_exc_lead1m - mean(gbr_train$ret_exc_lead1m))^2)
+
+Rsqr_oos_ols   = 1 - sum((gbr_test$ret_exc_lead1m - predict_ols)^2)  / denom_oos
+Rsqr_oos_ridge = 1 - sum((gbr_test$ret_exc_lead1m - predict_ridge)^2)/ denom_oos
+Rsqr_oos_rf    = 1 - sum((gbr_test$ret_exc_lead1m - predict_rf)^2 )  / denom_oos
+
+Rsqr_oos_ols
+Rsqr_oos_ridge
+Rsqr_oos_rf
+
+oosrs = data.frame(model = c("ols.3", "ridge.3", "rf.3"),
+                    oos = c(Rsqr_oos_ols, Rsqr_oos_ridge, Rsqr_oos_rf)*100)
+
+rs = full_join(oosrs, inrs)
+#xtable(rs, digits = 4)
+
+```
+
+b) Portfolio sort
+
+```{r}
+portfolio_sort <- function(data, variable, percentiles) {
+  breakpoints <- data %>% 
+    drop_na() %>% 
+    summarize(breakpoint = quantile(
+      {{ variable }}, 
+      probs = {{ percentiles }},
+      na.rm = TRUE
+    )) %>% 
+    pull(breakpoint) %>% 
+    as.numeric()
+
+  sorted_portfolios <- data %>% 
+    drop_na() %>% 
+    mutate(portfolio = findInterval({{ variable }},
+      breakpoints,
+      all.inside = TRUE
+    )) %>% 
+    pull(portfolio)
+
+  return(sorted_portfolios)
+}
+
+
+pf_df = gbr_test %>% rename(market_equity_scaled = market_equity) %>% 
+  left_join(gbr_original %>% select(eom, gvkey, market_equity))  %>% 
+  mutate(predicted_ols = c(0, predict_ols),
+         predicted_ridge = c(0, predict_ridge),
+         predicted_rf = c(0, predict_rf))
+
+# Construct the five portfolios (5 x 3 portfolios)
+portfolios = pf_df %>% 
+  group_by(eom) %>% 
+  mutate(
+    portfolio_ols   = paste("ols", portfolio_sort(data = cur_data(), variable = predicted_ols, percentiles = seq(0, 1, length=6)), sep="."), 
+    portfolio_ridge = paste("ridge", portfolio_sort(data = cur_data(), variable = predicted_ridge, percentiles = seq(0, 1, length=6)), sep="."),
+    portfolio_rf    = paste("rf",portfolio_sort(data = cur_data(), variable = predicted_rf, percentiles = seq(0, 1, length=6)), sep=".")
+  ) 
+
+# compute the monthly value-weighted returns of the portfolios
+portfolio_ols = portfolios %>% 
+  group_by(portfolio_ols, eom) %>% 
+  summarize(
+    ret = weighted.mean(ret_exc_lead1m, market_equity) 
+  ) %>% 
+  rename(portfolio = portfolio_ols)
+
+portfolio_ridge = portfolios %>% 
+  group_by(portfolio_ridge, eom) %>% 
+  summarize(
+    ret = weighted.mean(ret_exc_lead1m, market_equity) 
+  ) %>% 
+  rename(portfolio = portfolio_ridge)
+
+portfolio_rf = portfolios %>% 
+  group_by(portfolio_rf, eom) %>% 
+  summarize(
+    ret = weighted.mean(ret_exc_lead1m, market_equity) 
+  ) %>% 
+  rename(portfolio = portfolio_rf)
+
+# compute the monthly value-weighted returns of the 5-minus-1 long-short portfolio
+portfolio_ols_51 = portfolio_ols %>% 
+  group_by(eom) %>% 
+  summarize(
+    ret = mean(ret[portfolio == "ols.5"]) - 
+      mean(ret[portfolio == "ols.1"])                  
+  ) %>% 
+  mutate(portfolio = "ols.51")
+
+portfolio_ridge_51 = portfolio_ridge %>% 
+  group_by(eom) %>% 
+  summarize(
+    ret = mean(ret[portfolio == "ridge.5"]) - 
+      mean(ret[portfolio == "ridge.1"])                  
+  ) %>% 
+  mutate(portfolio = "ridge.51")
+
+portfolio_rf_51 = portfolio_rf %>% 
+  group_by(eom) %>% 
+  summarize(
+    ret = mean(ret[portfolio =="rf.5"]) - 
+      mean(ret[portfolio == "rf.1"])                  
+  ) %>% 
+  mutate(portfolio = "rf.51")
+
+
+# collect in one data set
+portfolios_retm = portfolio_ols %>% 
+  full_join(portfolio_ridge) %>% 
+  full_join(portfolio_rf) %>% 
+  full_join(portfolio_ols_51) %>% 
+  full_join(portfolio_ridge_51) %>% 
+  full_join(portfolio_rf_51)
+
+
+# Compute average excess return and its t-stat
+std.error <- function(x) sd(x)/sqrt(length(x))
+
+portfolios_avgret = portfolios_retm %>% 
+  group_by(portfolio) %>% 
+  summarise(avg_exc_ret = mean(ret),
+            t_stat_er = mean(ret) / std.error(ret))
+
+# the CAPM alpha, its t-statistic
+capm_alpha_lm = lmList(ret  ~ market_equity | portfolio, 
+                    data = portfolios_retm %>% left_join(gbr_original %>% select(eom, market_equity)))
+
+capm_alpha = lapply(capm_alpha_lm, function(mod) {stat <- summary(mod)$coefficients[1,1:4]}
+   ) %>% as.data.frame() %>% t()  %>% as.data.frame()
+
+capm_alpha$portfolio <- row.names(capm_alpha)
+
+portfolios_alpha = capm_alpha %>% rename(alpha = Estimate, tstat = 't value') %>% select(portfolio, alpha, tstat)
+
+# Sharpe ratio
+portfolios_sharpe = portfolios_retm %>% 
+  group_by(portfolio) %>% 
+  summarise(sharpe = mean(ret)/sd(ret))
+
+# information ratio (alpha divided by residual volatility)
+ir = lapply(capm_alpha_lm, function(mod) {resid_std <- sd(mod$residuals)}
+   ) %>% as.data.frame() %>% t()  %>% as.data.frame() %>% rename(resid_std = V1)
+ir$portfolio <- row.names(ir)
+
+portfolios_ir = portfolios_alpha %>% 
+  left_join(ir, by = "portfolio") %>% 
+  group_by(portfolio) %>% 
+  summarise(ir = alpha / resid_std)
+
+
+portfolios_all = portfolios_avgret %>% full_join(portfolios_alpha) %>% full_join(portfolios_sharpe) %>%  full_join(portfolios_ir)
+
+portfolios_all %>% arrange(desc(alpha)) 
+ 
+#xtable(portfolios_all, digits=4)
+
+```
+
+
+
+## Problem 6
+Do everything above again but with all 21 characteristics 
+
+
+### 6.2.a) OLS regression
+
+```{r}
+
+eom_lm = gbr_train %>% 
+  # select the variables we need for the regression
+  select(ret_exc_lead1m, eom, gvkey, be_me, ret_12_1, market_equity, ret_1_0, rvol_252d, beta_252d, qmj_safety, rmax1_21d, 
+         chcsho_12m, ni_me, eq_dur, ret_60_12, ope_be, gp_at, ebit_sale, at_gr1, sale_gr1, at_be,
+         cash_at, age, z_score) %>% 
+  # make a "data set" for each date
+  nest(data = -eom) %>% 
+  mutate(lm = map(data, # map: Apply a function to each element of a vector -> do a regression for each time point
+                    ~tidy(lm(ret_exc_lead1m ~ ., data = .x %>% select(-gvkey)))) # extract summary statistics
+         ) %>% 
+  unnest(lm)
+  
+# average across the time-series dimension
+coefficients = eom_lm %>% 
+  group_by(term) %>% # for each regression variable
+  summarize(
+    estimate_mean = mean(estimate),
+    std_error = 1/sqrt(n())*sqrt(mean((estimate - estimate_mean)^2))
+  )
+
+#print(xtable(coefficients[order(match(coefficients$term, order)),], digits = 4), include.rownames=FALSE)
+
+```
+
+### 6.2.b) Ridge regression
+
+
+```{r}
+# define response variable and predictor matrix
+y = gbr_train_v$ret_exc_lead1m
+x = gbr_train_v %>% select(be_me, ret_12_1, market_equity, ret_1_0, rvol_252d, beta_252d, qmj_safety, rmax1_21d, 
+         chcsho_12m, ni_me, eq_dur, ret_60_12, ope_be, gp_at, ebit_sale, at_gr1, sale_gr1, at_be,
+         cash_at, age, z_score) %>% as.matrix()
+
+y_val = gbr_val$ret_exc_lead1m
+x_val = gbr_val %>% select(be_me, ret_12_1, market_equity, ret_1_0, rvol_252d, beta_252d, qmj_safety, rmax1_21d, 
+         chcsho_12m, ni_me, eq_dur, ret_60_12, ope_be, gp_at, ebit_sale, at_gr1, sale_gr1, at_be,
+         cash_at, age, z_score) %>% as.matrix()
+
+y_train = gbr_train$ret_exc_lead1m
+x_train = gbr_train %>% select(be_me, ret_12_1, market_equity, ret_1_0, rvol_252d, beta_252d, qmj_safety, rmax1_21d, 
+         chcsho_12m, ni_me, eq_dur, ret_60_12, ope_be, gp_at, ebit_sale, at_gr1, sale_gr1, at_be,
+         cash_at, age, z_score) %>% as.matrix()
+
+
+# define lambda interval
+lambda_interval =  seq(0.001, 10, length=10000) 
+
+# perform Ridge regression for each lambda value
+ridge_train = glmnet(x, y, alpha=0, standardize=FALSE, lambda=lambda_interval)
+
+
+# Use the estimated parameter to predict the return over the validation period, calculate the validation MSE
+mse_val = list()
+for (i in 1:length(lambda_interval)){
+  
+  ridge_val = predict(ridge_train, s = lambda_interval[i], newx = x_val)
+  
+  mse_val[i] = mean((ridge_val - y_val)^2)
+  
+}
+# pick the lambda that have the lowest mean-squared error
+lambda_hat = lambda_interval[which.min(unlist(mse_val))]
+
+df = data.frame(lambda_interval, unlist(mse_val)) 
+
+best_lambda = subset(df, lambda_interval == lambda_hat)
+
+df %>% 
+  ggplot() +
+  aes(x = lambda_interval, y = unlist.mse_val.) +
+  geom_point(col = "grey") + 
+  geom_point(data=best_lambda, color="red") +
+  theme_bw() +
+  labs(y = "Validation set mean-squared error", x = "Ridge parameter, lambda") +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.000001, decimal.mark = '.')) + 
+  geom_text(data=best_lambda, label="(0.47, 0.02087676)", vjust=-1.1, hjust=0, color="red")
+
+# Based on the optimal ridge parameter, lambda_hat, re-estimate the ridge regression coefficient using the entire in-sample data 
+ridge_best <- glmnet(x_train, y_train, alpha=0, standardize=FALSE, lambda = lambda_hat)
+
+```
+
+
+### 6.2.c) A Random Forest
+
+
+```{r}
+hyperparams_grid = expand.grid(
+  mtry = c(1/3, 2/3, 1)*ncol(x), 
+  max.depth = c(1,2,3), 
+  min.node.size = c(1, 10000) 
+)
+
+for(i in 1:nrow(hyperparams_grid)) {
+  # fit model for ith hyperparameter combination
+  rf_train = ranger(
+    formula         = ret_exc_lead1m ~ ., 
+    data            = gbr_train_v %>% select(-eom, -gvkey, -size_grp), 
+    sample.fraction = 0.5, 
+    num.trees       = 500, 
+    mtry            = hyperparams_grid$mtry[i],
+    min.node.size   = hyperparams_grid$min.node.size[i],
+    max.depth       = hyperparams_grid$max.depth[i],
+    verbose         = FALSE, 
+    seed            = 1
+  )
+# validation set MSE
+  rf_val = predict(rf_train, data = x_val)$predictions
+  hyperparams_grid$mse_val[i] = mean((rf_val - y_val)^2)
+  
+}
+
+best_hyperparams <- subset(hyperparams_grid, mse_val==min(mse_val))
+best_hyper <- type.convert(best_hyperparams, as.is = TRUE)  %>% 
+  pivot_longer(values_to = "value", names_to = "hyper_parameter", cols = mtry:min.node.size) 
+
+#  Based on the optimal hyper-parameters, re-estimate the random forest using the entire in-sample data
+
+rf_best = ranger(
+    formula         = ret_exc_lead1m ~ ., 
+    data            = gbr_train_v %>% select(-eom, -gvkey, -size_grp), 
+    sample.fraction = 0.5, 
+    num.trees       = 500, 
+    mtry            = best_hyperparams$mtry[1],
+    min.node.size   = best_hyperparams$min.node.size[1],
+    max.depth       = best_hyperparams$max.depth[1],
+    verbose         = FALSE,
+    seed            = 1, 
+    importance = "impurity" 
+  )
+
+# plot 
+hyperparams_grid %>% 
+  arrange(mse_val) %>% 
+  pivot_longer(values_to = "value", names_to = "hyper_parameter", cols = mtry:min.node.size) %>% 
+  ggplot(aes(x=value, y = mse_val)) + 
+  geom_point() + 
+  geom_point(data=best_hyper, aes(x=value, y = mse_val), color="red") +
+  facet_wrap(vars(hyper_parameter), scales = "free_x") +
+  theme_bw() +
+  geom_text(data=best_hyper[1:3,], label="MSE = 0.02083981", vjust=0, hjust=-0.1, color="red", size=2.5) +
+  labs(y = "Validation set mean-squared error", x = "")
+
+```
+
+
+### 6.3: In-sample R-squared
+
+```{r}
+order = unlist(c("(Intercept)", chars))
+coefficients = coefficients[order(match(coefficients$term, order)),] # so it matches order in X matrix
+
+coef_ols = as.matrix(coefficients$estimate_mean) 
+# as.matrix makes it the wrong dimension - transpose to match coefficients
+predict_insam_ols   = t(coef_ols) %*% t(as.matrix(cbind(rep(1, nrow(x_train)), x_train)))
+predict_insam_ridge = predict(ridge_best, newx = x_train)
+predict_insam_rf    = predict(rf_best, data = x_train)$predictions
+
+denom = sum( (y_train - mean(y_train))^2)
+
+Rsqr_insam_ols   = 1 - sum((y_train - predict_insam_ols)^2)/ denom
+Rsqr_insam_ridge = 1 - sum((y_train - predict_insam_ridge)^2)/ denom
+Rsqr_insam_rf    = 1 - sum((y_train - predict_insam_rf)^2 )/ denom
+
+Rsqr_insam_ols
+Rsqr_insam_ridge
+Rsqr_insam_rf
+
+inrs = data.frame(model = c("ols.3", "ridge.3", "rf.3"),
+                   is = c(Rsqr_insam_ols, Rsqr_insam_ridge, Rsqr_insam_rf)*100
+           )
+
+```
+
+
+### 6.4: Feature importance
+
+```{r}
+# OLS
+ols_vi = coefficients %>% mutate(OLS = abs(estimate_mean / std_error)) %>% select(term, OLS) 
+
+# Ridge 
+ridge_vi = data.frame(Ridge = abs(coef(ridge_best)) %>% summary() %>% data.frame() %>% pull(x),
+term = c("(Intercept)", unlist(chars)))
+
+# Random forest
+rf_vi =  data.frame(RF = abs(rf_best$variable.importance),
+                    term = unlist(chars))
+
+vi_all = full_join(ols_vi, ridge_vi) %>% full_join(rf_vi)
+
+#print(xtable(vi_all, digits = 4), include.rownames = FALSE)
+```
+
+### 6.5: Out-of-sample testing
+
+out-of-sample R-squared
+```{r}
+gbr_test = gbr %>% filter(year(ymd(eom)) > year(ymd("2011-01-01"))) 
+
+x_test = gbr_test %>% 
+  select(be_me, ret_12_1, market_equity, ret_1_0, rvol_252d, beta_252d, qmj_safety, rmax1_21d,
+         chcsho_12m, ni_me, eq_dur, ret_60_12, ope_be, gp_at, ebit_sale, at_gr1, sale_gr1, at_be,
+         cash_at, age, z_score) %>% 
+  as.matrix()
+
+coef_ols = as.matrix(coefficients[order(match(coefficients$term, order)),]$estimate_mean) 
+
+predict_ols   = t(coef_ols) %*% t(as.matrix(cbind(rep(1, nrow(x_test)), x_test)))
+predict_ridge = predict(ridge_best, newx = x_test)
+predict_rf    = predict(rf_best, data = x_test)$predictions
+
+denom_oos = sum((gbr_test$ret_exc_lead1m - mean(gbr_train$ret_exc_lead1m))^2)
+
+Rsqr_oos_ols   = 1 - sum((gbr_test$ret_exc_lead1m - predict_ols)^2)  / denom_oos
+Rsqr_oos_ridge = 1 - sum((gbr_test$ret_exc_lead1m - predict_ridge)^2)/ denom_oos
+Rsqr_oos_rf    = 1 - sum((gbr_test$ret_exc_lead1m - predict_rf)^2 )  / denom_oos
+
+Rsqr_oos_ols
+Rsqr_oos_ridge
+Rsqr_oos_rf
+
+oosrs = data.frame(model = c("ols.3", "ridge.3", "rf.3"),
+                    oos = c(Rsqr_oos_ols, Rsqr_oos_ridge, Rsqr_oos_rf)*100)
+
+rs = full_join(oosrs, inrs)
+#print(xtable(rs, digits = 4), include.rownames= FALSE)
+
+```
+
+
+portfolio performance 
+```{r}
+pf_df = gbr_test %>% rename(market_equity_scaled = market_equity) %>% 
+  left_join(gbr_original %>% select(eom, gvkey, market_equity))  %>% 
+  mutate(predicted_ols = c(0, predict_ols),
+         predicted_ridge = c(0, predict_ridge),
+         predicted_rf = c(0, predict_rf))
+
+# Construct the five portfolios (5 x 3 portfolios)
+portfolios = pf_df %>% 
+  group_by(eom) %>% 
+  mutate(
+    portfolio_ols   = paste("ols", portfolio_sort(data = cur_data(), variable = predicted_ols, percentiles = seq(0, 1, length=6)), sep="."), 
+    portfolio_ridge = paste("ridge", portfolio_sort(data = cur_data(), variable = predicted_ridge, percentiles = seq(0, 1, length=6)), sep="."),
+    portfolio_rf    = paste("rf",portfolio_sort(data = cur_data(), variable = predicted_rf, percentiles = seq(0, 1, length=6)), sep=".")
+  ) 
+
+# compute the monthly value-weighted returns of the portfolios
+portfolio_ols = portfolios %>% 
+  group_by(portfolio_ols, eom) %>% 
+  summarize(
+    ret = weighted.mean(ret_exc_lead1m, market_equity) 
+  ) %>% 
+  rename(portfolio = portfolio_ols)
+
+portfolio_ridge = portfolios %>% 
+  group_by(portfolio_ridge, eom) %>% 
+  summarize(
+    ret = weighted.mean(ret_exc_lead1m, market_equity) 
+  ) %>% 
+  rename(portfolio = portfolio_ridge)
+
+portfolio_rf = portfolios %>% 
+  group_by(portfolio_rf, eom) %>% 
+  summarize(
+    ret = weighted.mean(ret_exc_lead1m, market_equity) 
+  ) %>% 
+  rename(portfolio = portfolio_rf)
+
+# compute the monthly value-weighted returns of the 5-minus-1 long-short portfolio
+portfolio_ols_51 = portfolio_ols %>% 
+  group_by(eom) %>% 
+  summarize(
+    ret = mean(ret[portfolio == "ols.5"]) - 
+      mean(ret[portfolio == "ols.1"])                  
+  ) %>% 
+  mutate(portfolio = "ols.51")
+
+portfolio_ridge_51 = portfolio_ridge %>% 
+  group_by(eom) %>% 
+  summarize(
+    ret = mean(ret[portfolio == "ridge.5"]) - 
+      mean(ret[portfolio == "ridge.1"])                  
+  ) %>% 
+  mutate(portfolio = "ridge.51")
+
+portfolio_rf_51 = portfolio_rf %>% 
+  group_by(eom) %>% 
+  summarize(
+    ret = mean(ret[portfolio =="rf.5"]) - 
+      mean(ret[portfolio == "rf.1"])                  
+  ) %>% 
+  mutate(portfolio = "rf.51")
+
+
+# collect in one data set
+portfolios_retm = portfolio_ols %>% 
+  full_join(portfolio_ridge) %>% 
+  full_join(portfolio_rf) %>% 
+  full_join(portfolio_ols_51) %>% 
+  full_join(portfolio_ridge_51) %>% 
+  full_join(portfolio_rf_51)
+
+
+# Compute average excess return and its t-stat
+std.error <- function(x) sd(x)/sqrt(length(x))
+
+portfolios_avgret = portfolios_retm %>% 
+  group_by(portfolio) %>% 
+  summarise(avg_exc_ret = mean(ret),
+            t_stat_er = mean(ret) / std.error(ret))
+
+# the CAPM alpha, its t-statistic
+capm_alpha_lm = lmList(ret  ~ market_equity | portfolio, 
+                    data = portfolios_retm %>% left_join(gbr_original %>% select(eom, market_equity)))
+
+capm_alpha = lapply(capm_alpha_lm, function(mod) {stat <- summary(mod)$coefficients[1,1:4]}
+   ) %>% as.data.frame() %>% t()  %>% as.data.frame()
+
+capm_alpha$portfolio <- row.names(capm_alpha)
+
+portfolios_alpha = capm_alpha %>% rename(alpha = Estimate, tstat = 't value') %>% select(portfolio, alpha, tstat)
+
+# Sharpe ratio
+portfolios_sharpe = portfolios_retm %>% 
+  group_by(portfolio) %>% 
+  summarise(sharpe = mean(ret)/sd(ret))
+
+# information ratio (alpha divided by residual volatility)
+ir = lapply(capm_alpha_lm, function(mod) {resid_std <- sd(mod$residuals)}
+   ) %>% as.data.frame() %>% t()  %>% as.data.frame() %>% rename(resid_std = V1)
+ir$portfolio <- row.names(ir)
+
+portfolios_ir = portfolios_alpha %>% 
+  left_join(ir, by = "portfolio") %>% 
+  group_by(portfolio) %>% 
+  summarise(ir = alpha / resid_std)
+
+
+portfolios_all = portfolios_avgret %>% full_join(portfolios_alpha) %>% full_join(portfolios_sharpe) %>%  full_join(portfolios_ir)
+
+#print(xtable(portfolios_all, digits = 4), include.rownames= FALSE)
+
+```
+
+
+
